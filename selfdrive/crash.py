@@ -2,11 +2,13 @@
 import os
 import sys
 import threading
+import capnp
 from selfdrive.version import version, dirty
 
 from selfdrive.swaglog import cloudlog
+from common.android import ANDROID
 
-if os.getenv("NOLOG") or os.getenv("NOCRASH"):
+if os.getenv("NOLOG") or os.getenv("NOCRASH") or not ANDROID:
   def capture_exception(*exc_info):
     pass
   def bind_user(**kwargs):
@@ -22,7 +24,9 @@ else:
                   install_sys_hook=False, transport=HTTPTransport, release=version, tags={'dirty': dirty})
 
   def capture_exception(*args, **kwargs):
-    client.captureException(*args, **kwargs)
+    exc_info = sys.exc_info()
+    if not exc_info[0] is capnp.lib.capnp.KjException:
+      client.captureException(*args, **kwargs)
     cloudlog.error("crash", exc_info=kwargs.get('exc_info', 1))
 
   def bind_user(**kwargs):

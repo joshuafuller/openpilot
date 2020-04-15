@@ -10,7 +10,7 @@
 
 const int GM_MAX_STEER = 300;
 const int GM_MAX_RT_DELTA = 128;          // max delta torque allowed for real time checks
-const int32_t GM_RT_INTERVAL = 250000;    // 250ms between real time checks
+const uint32_t GM_RT_INTERVAL = 250000;    // 250ms between real time checks
 const int GM_MAX_RATE_UP = 7;
 const int GM_MAX_RATE_DOWN = 17;
 const int GM_DRIVER_TORQUE_ALLOWANCE = 50;
@@ -18,102 +18,102 @@ const int GM_DRIVER_TORQUE_FACTOR = 4;
 const int GM_MAX_GAS = 3072;
 const int GM_MAX_REGEN = 1404;
 const int GM_MAX_BRAKE = 350;
+const AddrBus GM_TX_MSGS[] = {{384, 0}, {1033, 0}, {1034, 0}, {715, 0}, {880, 0},  // pt bus
+                              {161, 1}, {774, 1}, {776, 1}, {784, 1},   // obs bus
+                              {789, 2},  // ch bus
+                              {0x104c006c, 3}, {0x10400060, 3}};  // gmlan
 
-int gm_brake_prev = 0;
-int gm_gas_prev = 0;
-int gm_speed = 0;
-// silence everything if stock car control ECUs are still online
-int gm_ascm_detected = 0;
-int gm_ignition_started = 0;
+// TODO: do checksum and counter checks. Add correct timestep, 0.1s for now.
+AddrCheckStruct gm_rx_checks[] = {
+  {.addr = {388}, .bus = 0, .expected_timestep = 100000U},
+  {.addr = {842}, .bus = 0, .expected_timestep = 100000U},
+  {.addr = {481}, .bus = 0, .expected_timestep = 100000U},
+  {.addr = {241}, .bus = 0, .expected_timestep = 100000U},
+  {.addr = {417}, .bus = 0, .expected_timestep = 100000U},
+};
+const int GM_RX_CHECK_LEN = sizeof(gm_rx_checks) / sizeof(gm_rx_checks[0]);
+
+bool gm_moving = false;
 int gm_rt_torque_last = 0;
 int gm_desired_torque_last = 0;
 uint32_t gm_ts_last = 0;
 struct sample_t gm_torque_driver;         // last few driver torques measured
 
-static void gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
-  int bus_number = (to_push->RDTR >> 4) & 0xFF;
-  uint32_t addr;
-  if (to_push->RIR & 4) {
-    // Extended
-    // Not looked at, but have to be separated
-    // to avoid address collision
-    addr = to_push->RIR >> 3;
-  } else {
-    // Normal
-    addr = to_push->RIR >> 21;
-  }
+static int gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
 
-  if (addr == 388) {
-    int torque_driver_new = (((to_push->RDHR >> 16) & 0x7) << 8) | ((to_push->RDHR >> 24) & 0xFF);
-    torque_driver_new = to_signed(torque_driver_new, 11);
-    // update array of samples
-    update_sample(&gm_torque_driver, torque_driver_new);
-  }
+  bool valid = addr_safety_check(to_push, gm_rx_checks, GM_RX_CHECK_LEN,
+                                 NULL, NULL, NULL);
 
-  if (addr == 0x1f1 && bus_number == 0) {
-    //Bit 5 should be ignition "on"
-    //Backup plan is Bit 2 (accessory power)
-    uint32_t ign = (to_push->RDLR) & 0x20;
-    gm_ignition_started = ign > 0;
-  }
+  if (valid && (GET_BUS(to_push) == 0)) {
+    int addr = GET_ADDR(to_push);
 
-  // sample speed, really only care if car is moving or not
-  // rear left wheel speed
-  if (addr == 842) {
-    gm_speed = to_push->RDLR & 0xFFFF;
-  }
+    if (addr == 388) {
+      int torque_driver_new = ((GET_BYTE(to_push, 6) & 0x7) << 8) | GET_BYTE(to_push, 7);
+      torque_driver_new = to_signed(torque_driver_new, 11);
+      // update array of samples
+      update_sample(&gm_torque_driver, torque_driver_new);
+    }
 
-  // Check if ASCM or LKA camera are online
-  // on powertrain bus.
-  // 384 = ASCMLKASteeringCmd
-  // 715 = ASCMGasRegenCmd
-  if (bus_number == 0 && (addr == 384 || addr == 715)) {
-    gm_ascm_detected = 1;
-    controls_allowed = 0;
-  }
+    // sample speed, really only care if car is moving or not
+    // rear left wheel speed
+    if (addr == 842) {
+      gm_moving = GET_BYTE(to_push, 0) | GET_BYTE(to_push, 1);
+    }
 
-  // ACC steering wheel buttons
-  if (addr == 481) {
-    int buttons = (to_push->RDHR >> 12) & 0x7;
-    // res/set - enable, cancel button - disable
-    if (buttons == 2 || buttons == 3) {
-      controls_allowed = 1;
-    } else if (buttons == 6) {
-      controls_allowed = 0;
+    // ACC steering wheel buttons
+    if (addr == 481) {
+      int button = (GET_BYTE(to_push, 5) & 0x70) >> 4;
+      switch (button) {
+        case 2:  // resume
+        case 3:  // set
+          controls_allowed = 1;
+          break;
+        case 6:  // cancel
+          controls_allowed = 0;
+          break;
+        default:
+          break;  // any other button is irrelevant
+      }
+    }
+
+    // exit controls on rising edge of brake press or on brake press when
+    // speed > 0
+    if (addr == 241) {
+      // Brake pedal's potentiometer returns near-zero reading
+      // even when pedal is not pressed
+      bool brake_pressed = GET_BYTE(to_push, 1) >= 10;
+      if (brake_pressed && (!brake_pressed_prev || gm_moving)) {
+         controls_allowed = 0;
+      }
+      brake_pressed_prev = brake_pressed;
+    }
+
+    // exit controls on rising edge of gas press
+    if (addr == 417) {
+      bool gas_pressed = GET_BYTE(to_push, 6) != 0;
+      if (gas_pressed && !gas_pressed_prev) {
+        controls_allowed = 0;
+      }
+      gas_pressed_prev = gas_pressed;
+    }
+
+    // exit controls on regen paddle
+    if (addr == 189) {
+      bool regen = GET_BYTE(to_push, 0) & 0x20;
+      if (regen) {
+        controls_allowed = 0;
+      }
+    }
+
+    // Check if ASCM or LKA camera are online
+    // on powertrain bus.
+    // 384 = ASCMLKASteeringCmd
+    // 715 = ASCMGasRegenCmd
+    if ((safety_mode_cnt > RELAY_TRNS_TIMEOUT) && ((addr == 384) || (addr == 715))) {
+      relay_malfunction = true;
     }
   }
-
-  // exit controls on rising edge of brake press or on brake press when
-  // speed > 0
-  if (addr == 241) {
-    int brake = (to_push->RDLR & 0xFF00) >> 8;
-    // Brake pedal's potentiometer returns near-zero reading
-    // even when pedal is not pressed
-    if (brake < 10) {
-      brake = 0;
-    }
-    if (brake && (!gm_brake_prev || gm_speed)) {
-       controls_allowed = 0;
-    }
-    gm_brake_prev = brake;
-  }
-
-  // exit controls on rising edge of gas press
-  if (addr == 417) {
-    int gas = to_push->RDHR & 0xFF0000;
-    if (gas && !gm_gas_prev && long_controls_allowed) {
-      controls_allowed = 0;
-    }
-    gm_gas_prev = gas;
-  }
-
-  // exit controls on regen paddle
-  if (addr == 189) {
-    int regen = to_push->RDLR & 0x20;
-    if (regen) {
-      controls_allowed = 0;
-    }
-  }
+  return valid;
 }
 
 // all commands: gas/regen, friction brake and steering
@@ -124,43 +124,42 @@ static void gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
 
 static int gm_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
 
-  // There can be only one! (ASCM)
-  if (gm_ascm_detected) {
-    return 0;
+  int tx = 1;
+  int addr = GET_ADDR(to_send);
+  int bus = GET_BUS(to_send);
+
+  if (!msg_allowed(addr, bus, GM_TX_MSGS, sizeof(GM_TX_MSGS)/sizeof(GM_TX_MSGS[0]))) {
+    tx = 0;
+  }
+
+  if (relay_malfunction) {
+    tx = 0;
   }
 
   // disallow actuator commands if gas or brake (with vehicle moving) are pressed
   // and the the latching controls_allowed flag is True
-  int pedal_pressed = gm_gas_prev || (gm_brake_prev && gm_speed);
-  int current_controls_allowed = controls_allowed && !pedal_pressed;
-
-  uint32_t addr;
-  if (to_send->RIR & 4) {
-    // Extended
-    addr = to_send->RIR >> 3;
-  } else {
-    // Normal
-    addr = to_send->RIR >> 21;
-  }
+  int pedal_pressed = gas_pressed_prev || (brake_pressed_prev && gm_moving);
+  bool current_controls_allowed = controls_allowed && !pedal_pressed;
 
   // BRAKE: safety check
   if (addr == 789) {
-    int rdlr = to_send->RDLR;
-    int brake = ((rdlr & 0xF) << 8) + ((rdlr & 0xFF00) >> 8);
+    int brake = ((GET_BYTE(to_send, 0) & 0xFU) << 8) + GET_BYTE(to_send, 1);
     brake = (0x1000 - brake) & 0xFFF;
-    if (current_controls_allowed && long_controls_allowed) {
-      if (brake > GM_MAX_BRAKE) return 0;
-    } else {
-      if (brake != 0) return 0;
+    if (!current_controls_allowed) {
+      if (brake != 0) {
+        tx = 0;
+      }
+    }
+    if (brake > GM_MAX_BRAKE) {
+      tx = 0;
     }
   }
 
   // LKA STEER: safety check
   if (addr == 384) {
-    int rdlr = to_send->RDLR;
-    int desired_torque = ((rdlr & 0x7) << 8) + ((rdlr & 0xFF00) >> 8);
+    int desired_torque = ((GET_BYTE(to_send, 0) & 0x7U) << 8) + GET_BYTE(to_send, 1);
     uint32_t ts = TIM2->CNT;
-    int violation = 0;
+    bool violation = 0;
     desired_torque = to_signed(desired_torque, 11);
 
     if (current_controls_allowed) {
@@ -200,45 +199,37 @@ static int gm_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
     }
 
     if (violation) {
-      return false;
+      tx = 0;
     }
   }
 
-  // PARK ASSIST STEER: unlimited torque, no thanks
-  if (addr == 823) return 0;
-
   // GAS/REGEN: safety check
   if (addr == 715) {
-    int rdlr = to_send->RDLR;
-    int gas_regen = ((rdlr & 0x7F0000) >> 11) + ((rdlr & 0xF8000000) >> 27);
-    int apply = rdlr & 1;
-    if (current_controls_allowed && long_controls_allowed) {
-      if (gas_regen > GM_MAX_GAS) return 0;
-    } else {
-      // Disabled message is !engaed with gas
-      // value that corresponds to max regen.
-      if (apply || gas_regen != GM_MAX_REGEN) return 0;
+    int gas_regen = ((GET_BYTE(to_send, 2) & 0x7FU) << 5) + ((GET_BYTE(to_send, 3) & 0xF8U) >> 3);
+    // Disabled message is !engaged with gas
+    // value that corresponds to max regen.
+    if (!current_controls_allowed) {
+      bool apply = GET_BYTE(to_send, 0) & 1U;
+      if (apply || (gas_regen != GM_MAX_REGEN)) {
+        tx = 0;
+      }
+    }
+    if (gas_regen > GM_MAX_GAS) {
+      tx = 0;
     }
   }
 
   // 1 allows the message through
-  return true;
+  return tx;
 }
 
-static void gm_init(int16_t param) {
-  controls_allowed = 0;
-  gm_ignition_started = 0;
-}
-
-static int gm_ign_hook() {
-  return gm_ignition_started;
-}
 
 const safety_hooks gm_hooks = {
-  .init = gm_init,
+  .init = nooutput_init,
   .rx = gm_rx_hook,
   .tx = gm_tx_hook,
   .tx_lin = nooutput_tx_lin_hook,
-  .ignition = gm_ign_hook,
-  .fwd = nooutput_fwd_hook,
+  .fwd = default_fwd_hook,
+  .addr_check = gm_rx_checks,
+  .addr_check_len = sizeof(gm_rx_checks) / sizeof(gm_rx_checks[0]),
 };

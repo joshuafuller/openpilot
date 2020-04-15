@@ -1,6 +1,11 @@
 #ifndef COMMON_UTIL_H
 #define COMMON_UTIL_H
 
+#include <stdio.h>
+
+#ifndef sighandler_t
+typedef void (*sighandler_t)(int sig);
+#endif
 
 #ifndef __cplusplus
 

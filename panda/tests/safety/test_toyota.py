@@ -1,7 +1,9 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 import unittest
 import numpy as np
-import libpandasafety_py
+from panda import Panda
+from panda.tests.safety import libpandasafety_py
+from panda.tests.safety.common import StdTest, make_msg
 
 MAX_RATE_UP = 10
 MAX_RATE_DOWN = 25
@@ -13,13 +15,16 @@ MIN_ACCEL = -3000
 MAX_RT_DELTA = 375
 RT_INTERVAL = 250000
 
+STANDSTILL_THRESHOLD = 100  # 1kph
+
 MAX_TORQUE_ERROR = 350
+INTERCEPTOR_THRESHOLD = 475
 
-IPAS_OVERRIDE_THRESHOLD = 200
+TX_MSGS = [[0x283, 0], [0x2E6, 0], [0x2E7, 0], [0x33E, 0], [0x344, 0], [0x365, 0], [0x366, 0], [0x4CB, 0],  # DSU bus 0
+           [0x128, 1], [0x141, 1], [0x160, 1], [0x161, 1], [0x470, 1],  # DSU bus 1
+           [0x2E4, 0], [0x411, 0], [0x412, 0], [0x343, 0], [0x1D2, 0],  # LKAS + ACC
+           [0x200, 0], [0x750, 0]];  # interceptor + blindspot monitor
 
-ANGLE_DELTA_BP = [0., 5., 15.]
-ANGLE_DELTA_V = [5., .8, .15]     # windup limit
-ANGLE_DELTA_VU = [5., 3.5, 0.4]   # unwind limit
 
 def twos_comp(val, bits):
   if val >= 0:
@@ -33,11 +38,21 @@ def sign(a):
   else:
     return -1
 
+def toyota_checksum(msg, addr, len_msg):
+  checksum = (len_msg + addr + (addr >> 8))
+  for i in range(len_msg):
+    if i < 4:
+      checksum += (msg.RDLR >> (8 * i))
+    else:
+      checksum += (msg.RDHR >> (8 * (i - 4)))
+  return checksum & 0xff
+
+
 class TestToyotaSafety(unittest.TestCase):
   @classmethod
   def setUp(cls):
     cls.safety = libpandasafety_py.libpandasafety
-    cls.safety.toyota_init(100)
+    cls.safety.set_safety_hooks(Panda.SAFETY_TOYOTA, 100)
     cls.safety.init_tests_toyota()
 
   def _set_prev_torque(self, t):
@@ -46,187 +61,138 @@ class TestToyotaSafety(unittest.TestCase):
     self.safety.set_toyota_torque_meas(t, t)
 
   def _torque_meas_msg(self, torque):
-    to_send = libpandasafety_py.ffi.new('CAN_FIFOMailBox_TypeDef *')
-    to_send[0].RIR = 0x260 << 21
-
     t = twos_comp(torque, 16)
-    to_send[0].RDHR = t | ((t & 0xFF) << 16)
+    to_send = make_msg(0, 0x260)
+    to_send[0].RDHR = (t & 0xff00) | ((t & 0xFF) << 16)
+    to_send[0].RDHR |= toyota_checksum(to_send[0], 0x260, 8) << 24
     return to_send
-
-  def _torque_driver_msg(self, torque):
-    to_send = libpandasafety_py.ffi.new('CAN_FIFOMailBox_TypeDef *')
-    to_send[0].RIR = 0x260 << 21
-
-    t = twos_comp(torque, 16)
-    to_send[0].RDLR = t | ((t & 0xFF) << 16)
-    return to_send
-
-  def _torque_driver_msg_array(self, torque):
-    for i in range(6):
-      self.safety.toyota_ipas_rx_hook(self._torque_driver_msg(torque))
-
-  def _angle_meas_msg(self, angle):
-    to_send = libpandasafety_py.ffi.new('CAN_FIFOMailBox_TypeDef *')
-    to_send[0].RIR = 0x25 << 21
-
-    t = twos_comp(angle, 12)
-    to_send[0].RDLR = ((t & 0xF00) >> 8) | ((t & 0xFF) << 8)
-    return to_send
-
-  def _angle_meas_msg_array(self, angle):
-    for i in range(6):
-      self.safety.toyota_ipas_rx_hook(self._angle_meas_msg(angle))
 
   def _torque_msg(self, torque):
-    to_send = libpandasafety_py.ffi.new('CAN_FIFOMailBox_TypeDef *')
-    to_send[0].RIR = 0x2E4 << 21
-
     t = twos_comp(torque, 16)
+    to_send = make_msg(0, 0x2E4)
     to_send[0].RDLR = t | ((t & 0xFF) << 16)
-    return to_send
-
-  def _ipas_state_msg(self, state):
-    to_send = libpandasafety_py.ffi.new('CAN_FIFOMailBox_TypeDef *')
-    to_send[0].RIR = 0x262 << 21
-
-    to_send[0].RDLR = state & 0xF
-    return to_send
-
-  def _ipas_control_msg(self, angle, state):
-    # note: we command 2/3 of the angle due to CAN conversion
-    to_send = libpandasafety_py.ffi.new('CAN_FIFOMailBox_TypeDef *')
-    to_send[0].RIR = 0x266 << 21
-
-    t = twos_comp(angle, 12)
-    to_send[0].RDLR = ((t & 0xF00) >> 8) | ((t & 0xFF) << 8)
-    to_send[0].RDLR |= ((state & 0xf) << 4)
-
-    return to_send
-
-  def _speed_msg(self, speed):
-    to_send = libpandasafety_py.ffi.new('CAN_FIFOMailBox_TypeDef *')
-    to_send[0].RIR = 0xb4 << 21
-    speed = int(speed * 100 * 3.6)
-
-    to_send[0].RDHR = ((speed & 0xFF) << 16) | (speed & 0xFF00)
     return to_send
 
   def _accel_msg(self, accel):
-    to_send = libpandasafety_py.ffi.new('CAN_FIFOMailBox_TypeDef *')
-    to_send[0].RIR = 0x343 << 21
-
+    to_send = make_msg(0, 0x343)
     a = twos_comp(accel, 16)
     to_send[0].RDLR = (a & 0xFF) << 8 | (a >> 8)
     return to_send
 
-  def _send_gas_msg(self, gas):
-    to_send = libpandasafety_py.ffi.new('CAN_FIFOMailBox_TypeDef *')
-    to_send[0].RIR = 0x200 << 21
-    to_send[0].RDLR = gas
+  def _speed_msg(self, s):
+    offset = (0x6f << 8) + 0x1a  # there is a 0x1a6f offset in the signal
+    to_send = make_msg(0, 0xaa)
+    to_send[0].RDLR = ((s & 0xFF) << 8 | (s >> 8)) + offset
+    to_send[0].RDLR += ((s & 0xFF) << 24 | ((s >> 8) << 16)) + (offset << 16)
+    to_send[0].RDHR = ((s & 0xFF) << 8 | (s >> 8)) + offset
+    to_send[0].RDHR += ((s & 0xFF) << 24 | ((s >> 8) << 16)) + (offset << 16)
+    return to_send
 
+  def _brake_msg(self, brake):
+    to_send = make_msg(0, 0x226)
+    to_send[0].RDHR = brake << 5
+    to_send[0].RDHR |= toyota_checksum(to_send[0], 0x226, 8) << 24
+    return to_send
+
+  def _send_gas_msg(self, gas):
+    to_send = make_msg(0, 0x2C1)
+    to_send[0].RDHR = (gas & 0xFF) << 16
     return to_send
 
   def _send_interceptor_msg(self, gas, addr):
-    to_send = libpandasafety_py.ffi.new('CAN_FIFOMailBox_TypeDef *')
-    to_send[0].RIR = addr << 21
-    to_send[0].RDTR = 6
-    to_send[0].RDLR = ((gas & 0xff) << 8) | ((gas & 0xff00) >> 8)
-
+    gas2 = gas * 2
+    to_send = make_msg(0, addr, 6)
+    to_send[0].RDLR = ((gas & 0xff) << 8) | ((gas & 0xff00) >> 8) | \
+                      ((gas2 & 0xff) << 24) | ((gas2 & 0xff00) << 8)
     return to_send
 
-  def _pcm_cruise_msg(self, cruise_on, gas_pressed):
-    to_send = libpandasafety_py.ffi.new('CAN_FIFOMailBox_TypeDef *')
-    to_send[0].RIR = 0x1D2 << 21
-    to_send[0].RDLR = (cruise_on << 5) | ((not gas_pressed) << 4 )
-
+  def _pcm_cruise_msg(self, cruise_on):
+    to_send = make_msg(0, 0x1D2)
+    to_send[0].RDLR = cruise_on << 5
+    to_send[0].RDHR = to_send[0].RDHR | (toyota_checksum(to_send[0], 0x1D2, 8) << 24)
     return to_send
+
+  def test_spam_can_buses(self):
+    StdTest.test_spam_can_buses(self, TX_MSGS)
+
+  def test_relay_malfunction(self):
+    StdTest.test_relay_malfunction(self, 0x2E4)
 
   def test_default_controls_not_allowed(self):
     self.assertFalse(self.safety.get_controls_allowed())
 
   def test_manually_enable_controls_allowed(self):
-    self.safety.set_controls_allowed(1)
-    self.assertTrue(self.safety.get_controls_allowed())
+    StdTest.test_manually_enable_controls_allowed(self)
 
   def test_enable_control_allowed_from_cruise(self):
-    self.safety.toyota_rx_hook(self._pcm_cruise_msg(False, False))
+    self.safety.safety_rx_hook(self._pcm_cruise_msg(False))
     self.assertFalse(self.safety.get_controls_allowed())
-    self.safety.toyota_rx_hook(self._pcm_cruise_msg(True, False))
+    self.safety.safety_rx_hook(self._pcm_cruise_msg(True))
     self.assertTrue(self.safety.get_controls_allowed())
 
   def test_disable_control_allowed_from_cruise(self):
     self.safety.set_controls_allowed(1)
-    self.safety.toyota_rx_hook(self._pcm_cruise_msg(False, False))
+    self.safety.safety_rx_hook(self._pcm_cruise_msg(False))
     self.assertFalse(self.safety.get_controls_allowed())
 
   def test_prev_gas(self):
-    self.safety.toyota_rx_hook(self._pcm_cruise_msg(False, False))
-    self.assertFalse(self.safety.get_toyota_gas_prev())
-    self.safety.toyota_rx_hook(self._pcm_cruise_msg(False, True))
-    self.assertTrue(self.safety.get_toyota_gas_prev())
+    for g in range(0, 256):
+      self.safety.safety_rx_hook(self._send_gas_msg(g))
+      self.assertEqual(True if g > 0 else False, self.safety.get_gas_pressed_prev())
 
   def test_prev_gas_interceptor(self):
-    self.safety.toyota_rx_hook(self._send_interceptor_msg(0x0, 0x201))
+    self.safety.safety_rx_hook(self._send_interceptor_msg(0x0, 0x201))
     self.assertFalse(self.safety.get_gas_interceptor_prev())
-    self.safety.toyota_rx_hook(self._send_interceptor_msg(0x1000, 0x201))
+    self.safety.safety_rx_hook(self._send_interceptor_msg(0x1000, 0x201))
     self.assertTrue(self.safety.get_gas_interceptor_prev())
-    self.safety.toyota_rx_hook(self._send_interceptor_msg(0x0, 0x201))
+    self.safety.safety_rx_hook(self._send_interceptor_msg(0x0, 0x201))
     self.safety.set_gas_interceptor_detected(False)
 
   def test_disengage_on_gas(self):
-    for long_controls_allowed in [0, 1]:
-      self.safety.set_long_controls_allowed(long_controls_allowed)
-      self.safety.toyota_rx_hook(self._pcm_cruise_msg(False, False))
-      self.safety.toyota_rx_hook(self._pcm_cruise_msg(True, False))
-      self.assertTrue(self.safety.get_controls_allowed())
-      self.safety.toyota_rx_hook(self._pcm_cruise_msg(True, True))
-      if long_controls_allowed:
-        self.assertFalse(self.safety.get_controls_allowed())
-      else:
-        self.assertTrue(self.safety.get_controls_allowed())
-    self.safety.set_long_controls_allowed(True)
+    self.safety.safety_rx_hook(self._send_gas_msg(0))
+    self.safety.set_controls_allowed(True)
+    self.safety.safety_rx_hook(self._send_gas_msg(1))
+    self.assertFalse(self.safety.get_controls_allowed())
 
   def test_allow_engage_with_gas_pressed(self):
-    self.safety.toyota_rx_hook(self._pcm_cruise_msg(False, True))
-    self.safety.toyota_rx_hook(self._pcm_cruise_msg(True, True))
+    self.safety.safety_rx_hook(self._send_gas_msg(1))
+    self.safety.set_controls_allowed(True)
+    self.safety.safety_rx_hook(self._send_gas_msg(1))
     self.assertTrue(self.safety.get_controls_allowed())
-    self.safety.toyota_rx_hook(self._pcm_cruise_msg(True, True))
+    self.safety.safety_rx_hook(self._send_gas_msg(1))
     self.assertTrue(self.safety.get_controls_allowed())
 
   def test_disengage_on_gas_interceptor(self):
-    for long_controls_allowed in [0, 1]:
-      self.safety.set_long_controls_allowed(long_controls_allowed)
-      self.safety.toyota_rx_hook(self._send_interceptor_msg(0, 0x201))
-      self.safety.set_controls_allowed(1)
-      self.safety.toyota_rx_hook(self._send_interceptor_msg(0x1000, 0x201))
-      if long_controls_allowed:
-        self.assertFalse(self.safety.get_controls_allowed())
-      else:
-        self.assertTrue(self.safety.get_controls_allowed())
-      self.safety.toyota_rx_hook(self._send_interceptor_msg(0, 0x201))
+    for g in range(0, 0x1000):
+      self.safety.safety_rx_hook(self._send_interceptor_msg(0, 0x201))
+      self.safety.set_controls_allowed(True)
+      self.safety.safety_rx_hook(self._send_interceptor_msg(g, 0x201))
+      remain_enabled = g <= INTERCEPTOR_THRESHOLD
+      self.assertEqual(remain_enabled, self.safety.get_controls_allowed())
+      self.safety.safety_rx_hook(self._send_interceptor_msg(0, 0x201))
       self.safety.set_gas_interceptor_detected(False)
-    self.safety.set_long_controls_allowed(True)
+
+  def test_brake_disengage(self):
+    StdTest.test_allow_brake_at_zero_speed(self)
+    StdTest.test_not_allow_brake_when_moving(self, STANDSTILL_THRESHOLD)
 
   def test_allow_engage_with_gas_interceptor_pressed(self):
-    self.safety.toyota_rx_hook(self._send_interceptor_msg(0x1000, 0x201))
+    self.safety.safety_rx_hook(self._send_interceptor_msg(0x1000, 0x201))
     self.safety.set_controls_allowed(1)
-    self.safety.toyota_rx_hook(self._send_interceptor_msg(0x1000, 0x201))
+    self.safety.safety_rx_hook(self._send_interceptor_msg(0x1000, 0x201))
     self.assertTrue(self.safety.get_controls_allowed())
-    self.safety.toyota_rx_hook(self._send_interceptor_msg(0, 0x201))
+    self.safety.safety_rx_hook(self._send_interceptor_msg(0, 0x201))
     self.safety.set_gas_interceptor_detected(False)
 
   def test_accel_actuation_limits(self):
-    for long_controls_allowed in [0, 1]:
-      self.safety.set_long_controls_allowed(long_controls_allowed)
-      for accel in np.arange(MIN_ACCEL - 1000, MAX_ACCEL + 1000, 100):
-        for controls_allowed in [True, False]:
-          self.safety.set_controls_allowed(controls_allowed)
-          if controls_allowed and long_controls_allowed:
-            send = MIN_ACCEL <= accel <= MAX_ACCEL
-          else:
-            send = accel == 0
-          self.assertEqual(send, self.safety.toyota_tx_hook(self._accel_msg(accel)))
-    self.safety.set_long_controls_allowed(True)
+    for accel in np.arange(MIN_ACCEL - 1000, MAX_ACCEL + 1000, 100):
+      for controls_allowed in [True, False]:
+        self.safety.set_controls_allowed(controls_allowed)
+        if controls_allowed:
+          send = MIN_ACCEL <= accel <= MAX_ACCEL
+        else:
+          send = accel == 0
+        self.assertEqual(send, self.safety.safety_tx_hook(self._accel_msg(accel)))
 
   def test_torque_absolute_limits(self):
     for controls_allowed in [True, False]:
@@ -241,16 +207,16 @@ class TestToyotaSafety(unittest.TestCase):
           else:
             send = torque == 0
 
-          self.assertEqual(send, self.safety.toyota_tx_hook(self._torque_msg(torque)))
+          self.assertEqual(send, self.safety.safety_tx_hook(self._torque_msg(torque)))
 
   def test_non_realtime_limit_up(self):
     self.safety.set_controls_allowed(True)
 
     self._set_prev_torque(0)
-    self.assertTrue(self.safety.toyota_tx_hook(self._torque_msg(MAX_RATE_UP)))
+    self.assertTrue(self.safety.safety_tx_hook(self._torque_msg(MAX_RATE_UP)))
 
     self._set_prev_torque(0)
-    self.assertFalse(self.safety.toyota_tx_hook(self._torque_msg(MAX_RATE_UP + 1)))
+    self.assertFalse(self.safety.safety_tx_hook(self._torque_msg(MAX_RATE_UP + 1)))
 
   def test_non_realtime_limit_down(self):
     self.safety.set_controls_allowed(True)
@@ -258,12 +224,12 @@ class TestToyotaSafety(unittest.TestCase):
     self.safety.set_toyota_rt_torque_last(1000)
     self.safety.set_toyota_torque_meas(500, 500)
     self.safety.set_toyota_desired_torque_last(1000)
-    self.assertTrue(self.safety.toyota_tx_hook(self._torque_msg(1000 - MAX_RATE_DOWN)))
+    self.assertTrue(self.safety.safety_tx_hook(self._torque_msg(1000 - MAX_RATE_DOWN)))
 
     self.safety.set_toyota_rt_torque_last(1000)
     self.safety.set_toyota_torque_meas(500, 500)
     self.safety.set_toyota_desired_torque_last(1000)
-    self.assertFalse(self.safety.toyota_tx_hook(self._torque_msg(1000 - MAX_RATE_DOWN + 1)))
+    self.assertFalse(self.safety.safety_tx_hook(self._torque_msg(1000 - MAX_RATE_DOWN + 1)))
 
   def test_exceed_torque_sensor(self):
     self.safety.set_controls_allowed(True)
@@ -272,9 +238,9 @@ class TestToyotaSafety(unittest.TestCase):
       self._set_prev_torque(0)
       for t in np.arange(0, MAX_TORQUE_ERROR + 10, 10):
         t *= sign
-        self.assertTrue(self.safety.toyota_tx_hook(self._torque_msg(t)))
+        self.assertTrue(self.safety.safety_tx_hook(self._torque_msg(t)))
 
-      self.assertFalse(self.safety.toyota_tx_hook(self._torque_msg(sign * (MAX_TORQUE_ERROR + 10))))
+      self.assertFalse(self.safety.safety_tx_hook(self._torque_msg(sign * (MAX_TORQUE_ERROR + 10))))
 
   def test_realtime_limit_up(self):
     self.safety.set_controls_allowed(True)
@@ -285,211 +251,78 @@ class TestToyotaSafety(unittest.TestCase):
       for t in np.arange(0, 380, 10):
         t *= sign
         self.safety.set_toyota_torque_meas(t, t)
-        self.assertTrue(self.safety.toyota_tx_hook(self._torque_msg(t)))
-      self.assertFalse(self.safety.toyota_tx_hook(self._torque_msg(sign * 380)))
+        self.assertTrue(self.safety.safety_tx_hook(self._torque_msg(t)))
+      self.assertFalse(self.safety.safety_tx_hook(self._torque_msg(sign * 380)))
 
       self._set_prev_torque(0)
       for t in np.arange(0, 370, 10):
         t *= sign
         self.safety.set_toyota_torque_meas(t, t)
-        self.assertTrue(self.safety.toyota_tx_hook(self._torque_msg(t)))
+        self.assertTrue(self.safety.safety_tx_hook(self._torque_msg(t)))
 
       # Increase timer to update rt_torque_last
       self.safety.set_timer(RT_INTERVAL + 1)
-      self.assertTrue(self.safety.toyota_tx_hook(self._torque_msg(sign * 370)))
-      self.assertTrue(self.safety.toyota_tx_hook(self._torque_msg(sign * 380)))
+      self.assertTrue(self.safety.safety_tx_hook(self._torque_msg(sign * 370)))
+      self.assertTrue(self.safety.safety_tx_hook(self._torque_msg(sign * 380)))
 
   def test_torque_measurements(self):
-    self.safety.toyota_rx_hook(self._torque_meas_msg(50))
-    self.safety.toyota_rx_hook(self._torque_meas_msg(-50))
-    self.safety.toyota_rx_hook(self._torque_meas_msg(0))
-    self.safety.toyota_rx_hook(self._torque_meas_msg(0))
-    self.safety.toyota_rx_hook(self._torque_meas_msg(0))
-    self.safety.toyota_rx_hook(self._torque_meas_msg(0))
+    self.safety.safety_rx_hook(self._torque_meas_msg(50))
+    self.safety.safety_rx_hook(self._torque_meas_msg(-50))
+    self.safety.safety_rx_hook(self._torque_meas_msg(0))
+    self.safety.safety_rx_hook(self._torque_meas_msg(0))
+    self.safety.safety_rx_hook(self._torque_meas_msg(0))
+    self.safety.safety_rx_hook(self._torque_meas_msg(0))
 
     self.assertEqual(-51, self.safety.get_toyota_torque_meas_min())
     self.assertEqual(51, self.safety.get_toyota_torque_meas_max())
 
-    self.safety.toyota_rx_hook(self._torque_meas_msg(0))
+    self.safety.safety_rx_hook(self._torque_meas_msg(0))
     self.assertEqual(1, self.safety.get_toyota_torque_meas_max())
     self.assertEqual(-51, self.safety.get_toyota_torque_meas_min())
 
-    self.safety.toyota_rx_hook(self._torque_meas_msg(0))
+    self.safety.safety_rx_hook(self._torque_meas_msg(0))
     self.assertEqual(1, self.safety.get_toyota_torque_meas_max())
     self.assertEqual(-1, self.safety.get_toyota_torque_meas_min())
-
-  def test_ipas_override(self):
-
-    ## angle control is not active
-    self.safety.set_controls_allowed(1)
-
-    # 3 consecutive msgs where driver exceeds threshold but angle_control isn't active
-    self.safety.set_controls_allowed(1)
-    self._torque_driver_msg_array(IPAS_OVERRIDE_THRESHOLD + 1)
-    self.assertTrue(self.safety.get_controls_allowed())
-
-    self._torque_driver_msg_array(-IPAS_OVERRIDE_THRESHOLD - 1)
-    self.assertTrue(self.safety.get_controls_allowed())
-
-    # ipas state is override
-    self.safety.toyota_ipas_rx_hook(self._ipas_state_msg(5))
-    self.assertTrue(self.safety.get_controls_allowed())
-
-    ## now angle control is active
-    self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(0, 0))
-    self.safety.toyota_ipas_rx_hook(self._ipas_state_msg(0))
-
-    # 3 consecutive msgs where driver does exceed threshold
-    self.safety.set_controls_allowed(1)
-    self._torque_driver_msg_array(IPAS_OVERRIDE_THRESHOLD + 1)
-    self.assertFalse(self.safety.get_controls_allowed())
-
-    self.safety.set_controls_allowed(1)
-    self._torque_driver_msg_array(-IPAS_OVERRIDE_THRESHOLD - 1)
-    self.assertFalse(self.safety.get_controls_allowed())
-
-    # ipas state is override and torque isn't overriding any more
-    self.safety.set_controls_allowed(1)
-    self._torque_driver_msg_array(0)
-    self.safety.toyota_ipas_rx_hook(self._ipas_state_msg(5))
-    self.assertFalse(self.safety.get_controls_allowed())
-
-    # 3 consecutive msgs where driver does not exceed threshold and
-    # ipas state is not override
-    self.safety.set_controls_allowed(1)
-    self.safety.toyota_ipas_rx_hook(self._ipas_state_msg(0))
-    self.assertTrue(self.safety.get_controls_allowed())
-
-    self._torque_driver_msg_array(IPAS_OVERRIDE_THRESHOLD)
-    self.assertTrue(self.safety.get_controls_allowed())
-
-    self._torque_driver_msg_array(-IPAS_OVERRIDE_THRESHOLD)
-    self.assertTrue(self.safety.get_controls_allowed())
-
-    # reset no angle control at the end of the test
-    self.safety.reset_angle_control()
-
-  def test_angle_cmd_when_disabled(self):
-
-    self.safety.set_controls_allowed(0)
-
-    # test angle cmd too far from actual
-    angle_refs = [-10, 10]
-    deltas = range(-2, 3)
-    expected_results = [False, True, True, True, False]
-
-    for a in angle_refs:
-      self._angle_meas_msg_array(a)
-      for i, d in enumerate(deltas):
-        self.assertEqual(expected_results[i], self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(a + d, 1)))
-
-    # test ipas state cmd enabled
-    self._angle_meas_msg_array(0)
-    self.assertEqual(0, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(0, 3)))
-
-    # reset no angle control at the end of the test
-    self.safety.reset_angle_control()
-
-  def test_angle_cmd_when_enabled(self):
-
-    # ipas angle cmd should pass through when controls are enabled
-
-    self.safety.set_controls_allowed(1)
-    self._angle_meas_msg_array(0)
-    self.safety.toyota_ipas_rx_hook(self._speed_msg(0.1))
-
-    self.assertEqual(1, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(0, 1)))
-    self.assertEqual(1, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(4, 1)))
-    self.assertEqual(1, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(0, 3)))
-    self.assertEqual(1, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(-4, 3)))
-    self.assertEqual(1, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(-8, 3)))
-
-    # reset no angle control at the end of the test
-    self.safety.reset_angle_control()
-
-
-  def test_angle_cmd_rate_when_disabled(self):
-
-    # as long as the command is close to the measured, no rate limit is enforced when
-    # controls are disabled
-    self.safety.set_controls_allowed(0)
-    self.safety.toyota_ipas_rx_hook(self._angle_meas_msg(0))
-    self.assertEqual(1, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(0, 1)))
-    self.safety.toyota_ipas_rx_hook(self._angle_meas_msg(100))
-    self.assertEqual(1, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(100, 1)))
-    self.safety.toyota_ipas_rx_hook(self._angle_meas_msg(-100))
-    self.assertEqual(1, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(-100, 1)))
-
-    # reset no angle control at the end of the test
-    self.safety.reset_angle_control()
-
-  def test_angle_cmd_rate_when_enabled(self):
-
-    # when controls are allowed, angle cmd rate limit is enforced
-    # test 1: no limitations if we stay within limits
-    speeds = [0., 1., 5., 10., 15., 100.]
-    angles = [-300, -100, -10, 0, 10, 100, 300]
-    for a in angles:
-      for s in speeds:
-
-        # first test against false positives
-        self._angle_meas_msg_array(a)
-        self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(a, 1))
-        self.safety.set_controls_allowed(1)
-        self.safety.toyota_ipas_rx_hook(self._speed_msg(s))
-        max_delta_up = int(np.interp(s, ANGLE_DELTA_BP, ANGLE_DELTA_V) * 2 / 3. + 1.)
-        max_delta_down = int(np.interp(s, ANGLE_DELTA_BP, ANGLE_DELTA_VU) * 2 / 3. + 1.)
-        self.assertEqual(True, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(a + sign(a) * max_delta_up, 1)))
-        self.assertTrue(self.safety.get_controls_allowed())
-        self.assertEqual(True, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(a, 1)))
-        self.assertTrue(self.safety.get_controls_allowed())
-        self.assertEqual(True, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(a - sign(a) * max_delta_down, 1)))
-        self.assertTrue(self.safety.get_controls_allowed())
-
-        # now inject too high rates
-        self.assertEqual(False, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(a + sign(a) *
-                                                                                  (max_delta_up + 1), 1)))
-        self.assertFalse(self.safety.get_controls_allowed())
-        self.safety.set_controls_allowed(1)
-        self.assertEqual(True, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(a + sign(a) * max_delta_up, 1)))
-        self.assertTrue(self.safety.get_controls_allowed())
-        self.assertEqual(True, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(a, 1)))
-        self.assertTrue(self.safety.get_controls_allowed())
-        self.assertEqual(False, self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(a - sign(a) *
-                                                                                  (max_delta_down + 1), 1)))
-        self.assertFalse(self.safety.get_controls_allowed())
-
-    # reset no angle control at the end of the test
-    self.safety.reset_angle_control()
-
-  def test_angle_measured_rate(self):
-
-    speeds = [0., 1., 5., 10., 15., 100.]
-    angles = [-300, -100, -10, 0, 10, 100, 300]
-    angles = [10]
-    for a in angles:
-      for s in speeds:
-        self._angle_meas_msg_array(a)
-        self.safety.toyota_ipas_tx_hook(self._ipas_control_msg(a, 1))
-        self.safety.set_controls_allowed(1)
-        self.safety.toyota_ipas_rx_hook(self._speed_msg(s))
-        max_delta_up = int(np.interp(s, ANGLE_DELTA_BP, ANGLE_DELTA_V) * 2 / 3. + 1.)
-        max_delta_down = int(np.interp(s, ANGLE_DELTA_BP, ANGLE_DELTA_VU) * 2 / 3. + 1.)
-        self.safety.toyota_ipas_rx_hook(self._angle_meas_msg(a))
-        self.assertTrue(self.safety.get_controls_allowed())
-        self.safety.toyota_ipas_rx_hook(self._angle_meas_msg(a + 150))
-        self.assertFalse(self.safety.get_controls_allowed())
-
-    # reset no angle control at the end of the test
-    self.safety.reset_angle_control()
 
   def test_gas_interceptor_safety_check(self):
 
     self.safety.set_controls_allowed(0)
-    self.assertTrue(self.safety.toyota_tx_hook(self._send_interceptor_msg(0, 0x200)))
-    self.assertFalse(self.safety.toyota_tx_hook(self._send_interceptor_msg(0x1000, 0x200)))
+    self.assertTrue(self.safety.safety_tx_hook(self._send_interceptor_msg(0, 0x200)))
+    self.assertFalse(self.safety.safety_tx_hook(self._send_interceptor_msg(0x1000, 0x200)))
     self.safety.set_controls_allowed(1)
-    self.assertTrue(self.safety.toyota_tx_hook(self._send_interceptor_msg(0x1000, 0x200)))
+    self.assertTrue(self.safety.safety_tx_hook(self._send_interceptor_msg(0x1000, 0x200)))
+
+  def test_rx_hook(self):
+    # checksum checks
+    for msg in ["trq", "pcm"]:
+      self.safety.set_controls_allowed(1)
+      if msg == "trq":
+        to_push = self._torque_meas_msg(0)
+      if msg == "pcm":
+        to_push = self._pcm_cruise_msg(1)
+      self.assertTrue(self.safety.safety_rx_hook(to_push))
+      to_push[0].RDHR = 0
+      self.assertFalse(self.safety.safety_rx_hook(to_push))
+      self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_fwd_hook(self):
+
+    buss = list(range(0x0, 0x3))
+    msgs = list(range(0x1, 0x800))
+
+    blocked_msgs = [0x2E4, 0x412, 0x191]
+    blocked_msgs += [0x343]
+    for b in buss:
+      for m in msgs:
+        if b == 0:
+          fwd_bus = 2
+        elif b == 1:
+          fwd_bus = -1
+        elif b == 2:
+          fwd_bus = -1 if m in blocked_msgs else 0
+
+        # assume len 8
+        self.assertEqual(fwd_bus, self.safety.safety_fwd_hook(b, make_msg(b, m, 8)))
 
 
 if __name__ == "__main__":
